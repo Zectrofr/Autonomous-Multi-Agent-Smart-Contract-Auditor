@@ -87,13 +87,62 @@ rather than assumed:
 - Model: `claude-opus-5`, the current default Claude model (overridable with
   `--model`).
 
+## Backends: local Ollama (default) and Anthropic
+
+The agent can generate exploits from a free local model or from the Anthropic
+API. The backend is selected with `--backend`, or the `AGENT_BACKEND` env var,
+and defaults to `ollama` so the loop runs with no paid API and no network.
+
+- `--backend ollama` (default): talks to a local Ollama server over HTTP. The
+  default endpoint is `http://localhost:11434`, overridable with `OLLAMA_HOST`.
+  The default model is `qwen2.5-coder:7b`, overridable with `--model` or the
+  `OLLAMA_MODEL` env var. No API key is required. Start Ollama (`ollama serve`,
+  or the desktop app) and pull the model (`ollama pull qwen2.5-coder:7b`) first.
+- `--backend anthropic`: the original path, unchanged. It requires
+  `ANTHROPIC_API_KEY` and defaults to `claude-opus-5`.
+
+The two backends return the same shape of string, so the retry loop, response
+parser, Foundry sandbox, and labeling are identical regardless of which model
+wrote the exploit. The API key is only required (and only checked) on the
+anthropic path; the local backend needs no key.
+
+```bash
+# Local, free (default). Needs a running Ollama with the model pulled.
+python -m agent.run_agent --victim exploits/src/VulnerableVault.sol --vuln reentrancy
+
+# Pick a different local model
+python -m agent.run_agent --victim exploits/src/VulnerableVault.sol --vuln reentrancy \
+  --backend ollama --model qwen2.5-coder:7b
+```
+
+### Honest smoke-test result
+
+The local backend was run end to end against `VulnerableVault`: it generated
+exploit candidates, forge compiled and executed them, and real labels were
+written. On this reference victim `qwen2.5-coder:7b` did not drain the vault in
+6 attempts, so the run produced an honest `confirmed=false`. The end-to-end
+mechanism works; the 7B local model was not strong enough to write a passing
+reentrancy exploit within the retry budget. The committed `data/labels.csv`
+keeps only the confirmed `VulnerableVault` anchor (from the self-test reference
+exploit); the experimental local-model rows are not committed.
+
+### Corpus limitation (solc version mismatch)
+
+Labeling the SolidiFI corpus is currently blocked by a compiler mismatch, not by
+the model. The corpus victims are written for solc 0.5.x, while the `exploits/`
+Foundry sandbox pins solc 0.8.28. Every corpus victim therefore fails to compile
+in the current sandbox regardless of which backend generates the exploit, so
+those victims label `confirmed=false` by construction. Confirming corpus
+findings needs the sandbox to support the 0.5.x victims (a matching solc
+version), which is future work and independent of the backend choice.
+
 ## Run it
 
 From the repo root, with the venv active and Foundry on PATH:
 
 ```bash
-# Live run (needs ANTHROPIC_API_KEY)
-python -m agent.run_agent --victim exploits/src/VulnerableVault.sol --vuln reentrancy
+# Live run against the Anthropic API (needs ANTHROPIC_API_KEY)
+python -m agent.run_agent --victim exploits/src/VulnerableVault.sol --vuln reentrancy --backend anthropic
 ```
 
 Set the key first if it is not already set (PowerShell):

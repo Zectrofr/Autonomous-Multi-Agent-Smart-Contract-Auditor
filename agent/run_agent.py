@@ -21,10 +21,13 @@ of the LLM), so the plumbing can be validated without network access.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -32,11 +35,23 @@ from agent import prompts
 from agent.labels import Label, append_label
 from agent.sandbox import Sandbox, SandboxResult
 
-# Default model. Chosen by checking the current model list rather than from
-# memory (see agent/README.md): claude-opus-5 is the current default Claude
+# Default Anthropic model. Chosen by checking the current model list rather than
+# from memory (see agent/README.md): claude-opus-5 is the current default Claude
 # model. Overridable with --model.
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_RETRIES = 3
+
+# Local backend defaults (Ollama). The exploit agent runs against a free local
+# model when no paid API is available. qwen2.5-coder is a capable free code model
+# for this task; the exact tag is overridable with --model or the OLLAMA_MODEL
+# env var. The host is overridable with OLLAMA_HOST.
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+# Backend selection. The CLI --backend flag wins; then the AGENT_BACKEND env var;
+# then this default. ollama is the default so the agent runs with no paid API.
+DEFAULT_BACKEND = "ollama"
+BACKENDS = ("anthropic", "ollama")
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +197,86 @@ def call_llm(model: str, system_prompt: str, user_prompt: str) -> str:
     )
 
 
+def ollama_host() -> str:
+    """The Ollama base URL, overridable with OLLAMA_HOST."""
+    return os.environ.get("OLLAMA_HOST", "").strip() or DEFAULT_OLLAMA_HOST
+
+
+def call_llm_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
+    """One local Ollama chat call. Returns the response text as a plain string,
+    the SAME shape call_llm returns, so the retry loop, parser, sandbox, and
+    labeling are all unchanged by the backend switch.
+
+    Uses the local chat endpoint at <host>/api/chat with streaming off. The
+    request and response field names were verified at runtime against the running
+    Ollama version before this was wired (see agent/README.md): the request takes
+    a messages list of {role, content} objects, and a non streaming response
+    returns the assistant text at message.content, with done true. Parsing is
+    kept defensive so a response missing message.content fails as an empty
+    candidate (a normal failed attempt) rather than crashing the loop.
+    """
+    host = ollama_host()
+    url = host.rstrip("/") + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        # Non streaming so the whole answer arrives as one JSON object.
+        "stream": False,
+        "options": {
+            # Low temperature for more deterministic code output.
+            "temperature": 0.2,
+            # Raise the context window well above Ollama's small default so the
+            # full victim source and prompt scaffolding are not silently cut.
+            "num_ctx": 16384,
+        },
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=900) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise SystemExit(
+            f"ERROR: Ollama API returned HTTP {exc.code} at {url}: {detail[:400]}\n"
+            f"Check that the model '{model}' is pulled (ollama pull {model})."
+        )
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            f"ERROR: could not reach the Ollama API at {url}: {exc.reason}.\n"
+            "Start it with `ollama serve` (the Windows app starts it "
+            "automatically) and pull the model, then retry. To use the paid "
+            "Anthropic backend instead, pass --backend anthropic."
+        )
+
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        raise SystemExit(f"ERROR: Ollama returned non JSON output: {body[:400]}")
+
+    message = doc.get("message") if isinstance(doc, dict) else None
+    if isinstance(message, dict):
+        return message.get("content", "") or ""
+    # Some deployments echo an error field instead of a message.
+    if isinstance(doc, dict) and doc.get("error"):
+        raise SystemExit(f"ERROR: Ollama reported: {doc['error']}")
+    return ""
+
+
+def generate_candidate(backend: str, model: str, system_prompt: str, user_prompt: str) -> str:
+    """Dispatch one LLM generation to the selected backend, returning the raw
+    response text. Both backends return a plain string, so the caller is
+    identical for either one."""
+    if backend == "ollama":
+        return call_llm_ollama(model, system_prompt, user_prompt)
+    return call_llm(model, system_prompt, user_prompt)
+
+
 # ---------------------------------------------------------------------------
 # Built in reference candidate (offline self test only)
 # ---------------------------------------------------------------------------
@@ -306,6 +401,7 @@ def run_victim(
     self_test: bool,
     exploits_dir: Path,
     labels_path: Path,
+    backend: str = DEFAULT_BACKEND,
 ) -> Label:
     """Run the generate -> execute -> retry loop for one victim, then label it.
 
@@ -350,9 +446,11 @@ def run_victim(
                 pragma=pragma,
                 feedback=feedback,
             )
-            print(f"  asking {model} for an exploit"
+            print(f"  asking {model} via {backend} for an exploit"
                   + (" (with feedback from the last failure)" if feedback else ""))
-            response_text = call_llm(model, prompts.SYSTEM_PROMPT, user_prompt)
+            response_text = generate_candidate(
+                backend, model, prompts.SYSTEM_PROMPT, user_prompt
+            )
 
         files = parse_exploit_files(response_text)
         missing = [p for p in (prompts.ATTACKER_PATH, prompts.TEST_PATH) if p not in files]
@@ -449,9 +547,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum LLM attempts before giving up",
     )
     parser.add_argument(
+        "--backend",
+        default=None,
+        choices=list(BACKENDS),
+        help="LLM backend: 'ollama' (free local model, the default) or "
+        "'anthropic' (paid API). The AGENT_BACKEND env var is honored when this "
+        "flag is not given; the flag wins over the env var.",
+    )
+    parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help="Anthropic model id",
+        default=None,
+        help="model id. Defaults per backend: "
+        f"'{DEFAULT_OLLAMA_MODEL}' for ollama, '{DEFAULT_MODEL}' for anthropic. "
+        "For ollama, OLLAMA_MODEL is honored when this flag is not given.",
     )
     parser.add_argument(
         "--self-test",
@@ -485,16 +593,39 @@ def main(argv=None) -> int:
 
     labels_path = Path(args.labels).resolve() if args.labels else (root / "data" / "labels.csv")
 
-    # Fail loudly on a missing key before doing any work, unless self testing.
-    if not args.self_test:
+    # Backend precedence: explicit flag, then AGENT_BACKEND env var, then default.
+    backend = args.backend or os.environ.get("AGENT_BACKEND", "").strip() or DEFAULT_BACKEND
+    if backend not in BACKENDS:
+        print(f"ERROR: unknown backend '{backend}'. Choose one of {', '.join(BACKENDS)}.",
+              file=sys.stderr)
+        return 2
+
+    # Model precedence: explicit flag, then a per backend default (with the
+    # OLLAMA_MODEL env var honored for the local backend).
+    if args.model:
+        model = args.model
+    elif backend == "ollama":
+        model = os.environ.get("OLLAMA_MODEL", "").strip() or DEFAULT_OLLAMA_MODEL
+    else:
+        model = DEFAULT_MODEL
+
+    # Fail loudly on a missing key before doing any work, but only for the paid
+    # Anthropic backend. The local ollama backend needs no key. Self test needs
+    # neither.
+    if not args.self_test and backend == "anthropic":
         require_api_key()
+
+    if args.self_test:
+        mode = "self-test (offline reference)"
+    else:
+        mode = f"live LLM via {backend}: {model}"
 
     print("=" * 62)
     print("MODULE D STEP TWO: LLM EXPLOIT AGENT")
     print("=" * 62)
     print(f"  victim   : {victim_path}")
     print(f"  vuln     : {args.vuln}")
-    print(f"  mode     : {'self-test (offline reference)' if args.self_test else 'live LLM ' + args.model}")
+    print(f"  mode     : {mode}")
     print(f"  retries  : {args.retries}")
     print(f"  labels   : {labels_path}")
 
@@ -502,10 +633,11 @@ def main(argv=None) -> int:
         victim_path=victim_path,
         vuln_class=args.vuln,
         retries=args.retries,
-        model=args.model,
+        model=model,
         self_test=args.self_test,
         exploits_dir=exploits_dir,
         labels_path=labels_path,
+        backend=backend,
     )
 
     print("\n" + "=" * 62)
