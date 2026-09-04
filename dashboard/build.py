@@ -1,0 +1,1005 @@
+#!/usr/bin/env python3
+"""
+Build a standalone presentation dashboard for the Autonomous Smart Contract
+Auditor prototype.
+
+This is a READ-ONLY presentation layer. It reads five committed output files,
+computes display values, and writes them into dashboard/index.html as an
+embedded JSON blob so the final page opens by double-click with no server, no
+build step, and no network fetch.
+
+Inputs (never modified):
+  data/findings.csv       Module A static-scan findings
+  data/fp_report.md       Module A false-positive report
+  data/labels.csv         Module D execution-grounded labels
+  triage/scores.csv       C1 model-only scores per finding
+  eval/gap_report.md      model-only vs model-plus-execution gap
+
+Output:
+  dashboard/index.html    standalone, data embedded
+
+Every displayed number is derived from these files. Nothing is invented.
+"""
+
+import csv
+import io
+import json
+import os
+import re
+import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+FINDINGS = os.path.join(ROOT, "data", "findings.csv")
+FP_REPORT = os.path.join(ROOT, "data", "fp_report.md")
+LABELS = os.path.join(ROOT, "data", "labels.csv")
+SCORES = os.path.join(ROOT, "triage", "scores.csv")
+GAP_REPORT = os.path.join(ROOT, "eval", "gap_report.md")
+
+OUT = os.path.join(HERE, "index.html")
+
+
+# --------------------------------------------------------------------------
+# Generic markdown-table parsing
+# --------------------------------------------------------------------------
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def split_sections(md):
+    """Split a markdown doc into {heading: body_text} by '## ' headers."""
+    sections = {}
+    current = "_preamble"
+    buf = []
+    for line in md.splitlines():
+        m = re.match(r"^##\s+(.*)$", line)
+        if m:
+            sections[current] = "\n".join(buf)
+            current = m.group(1).strip()
+            buf = []
+        else:
+            buf.append(line)
+    sections[current] = "\n".join(buf)
+    return sections
+
+
+def parse_table(body):
+    """Parse the first markdown pipe-table in `body` into list-of-dicts.
+    Returns (headers, rows) where rows are lists of cell strings."""
+    lines = [ln for ln in body.splitlines() if ln.strip().startswith("|")]
+    if len(lines) < 2:
+        return [], []
+
+    def cells(ln):
+        parts = ln.strip().strip("|").split("|")
+        return [p.strip() for p in parts]
+
+    headers = cells(lines[0])
+    rows = []
+    for ln in lines[2:]:  # skip header + separator
+        c = cells(ln)
+        if len(c) == len(headers):
+            rows.append(c)
+    return headers, rows
+
+
+def clean_num(s):
+    """Turn '13.3%' -> 13.3 (float), '3212' -> 3212 (int), else the string."""
+    s = s.strip().replace("**", "")
+    pct = s.endswith("%")
+    t = s.rstrip("%").replace(",", "").replace("+", "")
+    try:
+        if "." in t:
+            v = float(t)
+        else:
+            v = int(t)
+        return v
+    except ValueError:
+        return s
+
+
+# --------------------------------------------------------------------------
+# Module A: fp_report.md
+# --------------------------------------------------------------------------
+def build_module_a():
+    md = read_text(FP_REPORT)
+    sec = split_sections(md)
+
+    def kv_table(name):
+        _, rows = parse_table(sec.get(name, ""))
+        out = {}
+        for r in rows:
+            out[r[0].strip()] = clean_num(r[1])
+        return out
+
+    corpus = kv_table("Corpus")
+    headline = kv_table("Headline")
+
+    # per-detector
+    _, drows = parse_table(sec.get("False positive rate by detector", ""))
+    detectors = []
+    for r in drows:
+        detectors.append({
+            "id": r[0],
+            "findings": clean_num(r[1]),
+            "tp": clean_num(r[2]),
+            "fp": clean_num(r[3]),
+            "fp_rate": clean_num(r[4]),
+        })
+
+    # per-severity
+    _, srows = parse_table(sec.get("False positive rate by severity", ""))
+    severity = []
+    for r in srows:
+        severity.append({
+            "severity": r[0],
+            "findings": clean_num(r[1]),
+            "tp": clean_num(r[2]),
+            "fp": clean_num(r[3]),
+            "fp_rate": clean_num(r[4]),
+        })
+
+    # cross-check total findings against findings.csv row count
+    with open(FINDINGS, newline="", encoding="utf-8") as fh:
+        rdr = csv.reader(fh)
+        next(rdr, None)
+        findings_row_count = sum(1 for _ in rdr)
+    contracts = set()
+    with open(FINDINGS, newline="", encoding="utf-8") as fh:
+        rdr = csv.DictReader(fh)
+        for row in rdr:
+            contracts.add(row["contract"])
+
+    return {
+        "corpus": corpus,
+        "headline": headline,
+        "detectors": detectors,
+        "severity": severity,
+        "verify": {
+            "findings_csv_rows": findings_row_count,
+            "distinct_contracts_in_findings": len(contracts),
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# Module D: labels.csv
+# --------------------------------------------------------------------------
+def categorize(row):
+    """Classify a label row from its evidence string, traceably."""
+    ev = row["evidence"]
+    if row["confirmed"].strip().lower() == "true":
+        return "drained", "Drained"
+    if "Compiler run failed" in ev or re.search(r"Error \(\d+\)", ev):
+        return "compile_failed", "Compile failed"
+    if "did not contain the required files" in ev or "Emit both" in ev:
+        return "truncated", "Model output truncated"
+    if "Revert" in ev or "revert" in ev:
+        return "runtime_revert", "Runtime revert"
+    return "other", "Other"
+
+
+def build_module_d():
+    labels = []
+    with open(LABELS, newline="", encoding="utf-8") as fh:
+        rdr = csv.DictReader(fh)
+        for row in rdr:
+            cat, cat_label = categorize(row)
+            labels.append({
+                "contract": row["contract"],
+                "vuln_class": row["vuln_class"],
+                "confirmed": row["confirmed"].strip().lower() == "true",
+                "attempts": clean_num(row["attempts"]),
+                "invariant": row["invariant_asserted"],
+                "evidence": row["evidence"],
+                "category": cat,
+                "category_label": cat_label,
+            })
+
+    summary = {
+        "total": len(labels),
+        "drained": sum(1 for l in labels if l["category"] == "drained"),
+        "runtime_revert": sum(1 for l in labels if l["category"] == "runtime_revert"),
+        "compile_failed": sum(1 for l in labels if l["category"] == "compile_failed"),
+        "truncated": sum(1 for l in labels if l["category"] == "truncated"),
+    }
+    summary["total_failed"] = summary["total"] - summary["drained"]
+
+    # Anchor balances, parsed from the confirmed VulnerableVault evidence.
+    anchor = None
+    for l in labels:
+        if l["category"] == "drained":
+            m = re.search(r"vault\s+(\d+)e18\s*->\s*(\d+)", l["evidence"])
+            am = re.search(r"attacker\s*\+(\d+)e18", l["evidence"])
+            anchor = {
+                "contract": l["contract"],
+                "victim_before": int(m.group(1)) if m else None,
+                "victim_after": int(m.group(2)) if m else None,
+                "attacker_delta": int(am.group(1)) if am else None,
+                "invariant": l["invariant"],
+                "evidence": l["evidence"],
+                "attempts": l["attempts"],
+            }
+            break
+
+    return {"labels": labels, "summary": summary, "anchor": anchor}
+
+
+# --------------------------------------------------------------------------
+# The gap: gap_report.md
+# --------------------------------------------------------------------------
+def build_gap():
+    md = read_text(GAP_REPORT)
+    sec = split_sections(md)
+
+    # Scope line (first paragraph of preamble after the H1)
+    scope = ""
+    for line in md.splitlines():
+        if line.startswith("Scope:"):
+            scope = line.strip()
+            break
+
+    # Counts (bullet list)
+    counts = []
+    for line in sec.get("Counts (n)", "").splitlines():
+        m = re.match(r"^\s*-\s+(.*)$", line)
+        if m:
+            counts.append(m.group(1).strip())
+
+    # Gap table
+    _, rows = parse_table(sec.get("Gap table", ""))
+    table = {}
+    order = []
+    for r in rows:
+        key = r[0].replace("*", "").strip()
+        entry = {
+            "label": key,
+            "precision": clean_num(r[1]),
+            "recall": clean_num(r[2]),
+            "fp_rate": clean_num(r[3]),
+            "tp": clean_num(r[4]) if len(r) > 4 else "",
+            "fp": clean_num(r[5]) if len(r) > 5 else "",
+            "fn": clean_num(r[6]) if len(r) > 6 else "",
+            "tn": clean_num(r[7]) if len(r) > 7 else "",
+        }
+        table[key] = entry
+        order.append(key)
+
+    # Verdict (first non-empty line of the section)
+    verdict = ""
+    for line in sec.get("Verdict", "").splitlines():
+        if line.strip():
+            verdict = line.strip()
+            break
+
+    # Limitations bullets
+    limitations = []
+    for line in sec.get("Limitations", "").splitlines():
+        m = re.match(r"^\s*-\s+(.*)$", line)
+        if m:
+            limitations.append(m.group(1).strip())
+
+    return {
+        "scope": scope,
+        "counts": counts,
+        "table": table,
+        "order": order,
+        "verdict": verdict,
+        "limitations": limitations,
+    }
+
+
+# --------------------------------------------------------------------------
+# Triage model: scores.csv distribution (gives the C1 stage a real visual)
+# --------------------------------------------------------------------------
+def build_triage():
+    bins = [0] * 10  # 0.0-0.1 ... 0.9-1.0
+    total = 0
+    ssum = 0.0
+    smin = 1.0
+    smax = 0.0
+    with open(SCORES, newline="", encoding="utf-8") as fh:
+        rdr = csv.DictReader(fh)
+        for row in rdr:
+            try:
+                s = float(row["c1_score"])
+            except (ValueError, KeyError):
+                continue
+            total += 1
+            ssum += s
+            smin = min(smin, s)
+            smax = max(smax, s)
+            idx = min(int(s * 10), 9)
+            bins[idx] += 1
+    return {
+        "bins": bins,
+        "total": total,
+        "mean": round(ssum / total, 3) if total else 0,
+        "min": round(smin, 3) if total else 0,
+        "max": round(smax, 3) if total else 0,
+    }
+
+
+# --------------------------------------------------------------------------
+# Assemble
+# --------------------------------------------------------------------------
+def build_data():
+    return {
+        "meta": {
+            "generated": datetime.date.today().isoformat(),
+            "sources": [
+                "data/findings.csv",
+                "data/fp_report.md",
+                "data/labels.csv",
+                "triage/scores.csv",
+                "eval/gap_report.md",
+            ],
+        },
+        "moduleA": build_module_a(),
+        "moduleD": build_module_d(),
+        "gap": build_gap(),
+        "triage": build_triage(),
+    }
+
+
+# HTML template lives in a separate module-level string built below.
+def render(data):
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    html = HTML_TEMPLATE.replace("__DATA_JSON__", payload)
+    with open(OUT, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return OUT
+
+
+HTML_TEMPLATE = r'''<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Autonomous Smart Contract Auditor</title>
+<style>
+:root{
+  --ink-900:#080b11;
+  --ink-850:#0b0f17;
+  --ink-800:#0e131d;
+  --panel:#121826;
+  --panel-2:#0f1420;
+  --line:#20293a;
+  --line-soft:#182233;
+  --tx:#e8edf5;
+  --tx-2:#9fb0c6;
+  --tx-3:#66748a;
+  --accent:#34d3ee;
+  --accent-2:#5b8cff;
+  --ok:#33d69f;
+  --bad:#ff5470;
+  --warn:#fbbf24;
+  --radius:16px;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;background:var(--ink-900);color:var(--tx);
+  font-family:var(--sans);line-height:1.55;
+  -webkit-font-smoothing:antialiased;letter-spacing:.1px;
+}
+.wrap{max-width:1160px;margin:0 auto;padding:0 28px}
+section{padding:88px 0;border-bottom:1px solid var(--line-soft)}
+section:last-of-type{border-bottom:none}
+.eyebrow{
+  font-family:var(--mono);font-size:12px;letter-spacing:2.5px;
+  text-transform:uppercase;color:var(--accent);margin:0 0 14px;font-weight:600;
+}
+h1,h2,h3{margin:0;line-height:1.12;letter-spacing:-.02em}
+h2{font-size:clamp(26px,3.4vw,40px);font-weight:700;margin-bottom:10px}
+.sub{color:var(--tx-2);font-size:16px;max-width:70ch;margin:0 0 40px}
+.mono{font-family:var(--mono)}
+.grid{display:grid;gap:18px}
+
+/* ---- hero ---- */
+.hero{
+  position:relative;overflow:hidden;border-bottom:1px solid var(--line);
+  background:
+    radial-gradient(1100px 520px at 78% -12%, rgba(52,211,238,.16), transparent 60%),
+    radial-gradient(760px 460px at 8% 8%, rgba(91,140,255,.13), transparent 60%),
+    linear-gradient(180deg,var(--ink-850),var(--ink-900));
+}
+.hero .wrap{padding-top:96px;padding-bottom:84px}
+.badge{
+  display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);
+  font-size:12px;letter-spacing:1px;color:var(--tx-2);
+  border:1px solid var(--line);background:rgba(255,255,255,.02);
+  padding:7px 14px;border-radius:999px;margin-bottom:26px;
+}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);
+  box-shadow:0 0 0 4px rgba(51,214,159,.16)}
+.hero h1{font-size:clamp(34px,5.4vw,60px);font-weight:780;max-width:18ch}
+.hero .lede{color:var(--tx-2);font-size:clamp(16px,1.9vw,20px);max-width:62ch;margin:20px 0 0}
+.pipe-note{color:var(--tx-3);font-size:13px;font-family:var(--mono);margin-top:8px}
+
+/* pipeline diagram */
+.pipeline{margin-top:52px}
+.pipe-row{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.stage{
+  flex:1 1 0;min-width:150px;position:relative;
+  background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:14px;padding:18px 16px;
+}
+.stage .k{font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:1.5px}
+.stage .t{font-weight:680;font-size:16px;margin-top:6px}
+.stage .d{color:var(--tx-3);font-size:12.5px;margin-top:6px;line-height:1.4}
+.arrow{display:flex;align-items:center;justify-content:center;width:34px;color:var(--tx-3);flex:0 0 34px}
+.arrow svg{width:22px;height:22px}
+.loopwrap{margin-top:14px;display:flex;align-items:center;gap:12px;
+  color:var(--accent-2);font-family:var(--mono);font-size:12.5px}
+.loopwrap svg{flex:0 0 auto}
+
+/* ---- cards / stats ---- */
+.stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.card{
+  background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:var(--radius);padding:24px;
+}
+.card .label{font-family:var(--mono);font-size:11.5px;letter-spacing:1.2px;
+  text-transform:uppercase;color:var(--tx-3)}
+.card .big{font-size:clamp(32px,4.4vw,46px);font-weight:760;margin-top:10px;
+  font-family:var(--mono);letter-spacing:-1px}
+.card .foot{color:var(--tx-2);font-size:13px;margin-top:8px}
+.big.ok{color:var(--ok)} .big.bad{color:var(--bad)} .big.acc{color:var(--accent)}
+
+/* ---- tables ---- */
+.tablewrap{border:1px solid var(--line);border-radius:14px;overflow:hidden;overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:12px 16px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+th{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;
+  color:var(--tx-3);background:var(--panel-2);position:sticky;top:0}
+td.num,th.num{text-align:right;font-family:var(--mono)}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.015)}
+.tag{display:inline-block;font-family:var(--mono);font-size:10.5px;letter-spacing:.6px;
+  padding:2px 8px;border-radius:6px;border:1px solid var(--line)}
+.tag.sec{color:var(--accent);border-color:rgba(52,211,238,.4);background:rgba(52,211,238,.07)}
+.pill{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);
+  font-size:12px;font-weight:600;padding:4px 11px;border-radius:999px}
+.pill.pass{color:#062;background:var(--ok)}
+.pill.fail{color:#fff;background:rgba(255,84,112,.16);border:1px solid rgba(255,84,112,.5)}
+.pill.pass{color:#04231a}
+
+/* fp bar chart */
+.bar-row{display:grid;grid-template-columns:210px 1fr 78px;align-items:center;gap:14px;
+  padding:7px 0}
+.bar-name{font-family:var(--mono);font-size:12.5px;color:var(--tx-2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;gap:8px;align-items:center}
+.bar-track{height:16px;background:var(--panel-2);border:1px solid var(--line-soft);
+  border-radius:6px;overflow:hidden;position:relative}
+.bar-fill{height:100%;border-radius:5px 0 0 5px}
+.bar-val{font-family:var(--mono);font-size:12.5px;text-align:right;color:var(--tx-2)}
+.chart-caption{color:var(--tx-3);font-size:13px;margin-top:16px;max-width:78ch}
+.legend{display:flex;gap:20px;flex-wrap:wrap;font-size:12.5px;color:var(--tx-2);margin:6px 0 20px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:7px;vertical-align:-1px}
+
+/* drain viz */
+.drain{display:grid;grid-template-columns:1fr 60px 1fr;gap:20px;align-items:center;margin-bottom:20px}
+.vault{background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:14px;padding:22px;text-align:center;position:relative}
+.vault .who{font-family:var(--mono);font-size:12px;letter-spacing:1px;color:var(--tx-3);text-transform:uppercase}
+.vault .amt{font-family:var(--mono);font-size:clamp(30px,4vw,44px);font-weight:760;margin:12px 0 4px}
+.vault .amt.bad{color:var(--bad)} .vault .amt.ok{color:var(--ok)}
+.vault .bar{height:8px;border-radius:4px;margin-top:14px;background:var(--panel-2);overflow:hidden}
+.vault .bar > i{display:block;height:100%}
+.drain-arrow{display:flex;flex-direction:column;align-items:center;color:var(--bad);gap:6px}
+.drain-arrow .lbl{font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--tx-3)}
+.dual{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.invariant{background:var(--panel-2);border:1px solid var(--line);border-left:3px solid var(--accent);
+  border-radius:10px;padding:16px 18px;font-size:13.5px;color:var(--tx-2)}
+.invariant .h{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:8px}
+.evidence-cell{font-family:var(--mono);font-size:11.5px;color:var(--tx-2);
+  max-width:520px;white-space:normal;line-height:1.4}
+
+/* gap centerpiece */
+.gap-panel{background:
+  radial-gradient(700px 300px at 90% -20%,rgba(51,214,159,.10),transparent),
+  linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:20px;padding:34px}
+.metric-block{margin:26px 0}
+.metric-block .mh{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px}
+.metric-block .mh .name{font-family:var(--mono);font-size:13px;letter-spacing:1px;text-transform:uppercase;color:var(--tx-2)}
+.metric-block .mh .delta{font-family:var(--mono);font-size:13px;font-weight:700}
+.delta.up{color:var(--ok)} .delta.down{color:var(--ok)}
+.gbar{display:grid;grid-template-columns:190px 1fr 66px;align-items:center;gap:14px;margin:9px 0}
+.gbar .glbl{font-family:var(--mono);font-size:12px;color:var(--tx-3)}
+.gbar .gtrack{height:26px;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:7px;overflow:hidden}
+.gbar .gfill{height:100%;display:flex;align-items:center;justify-content:flex-end;padding-right:0;border-radius:6px 0 0 6px}
+.gbar .gval{font-family:var(--mono);font-size:13px;font-weight:700;text-align:right}
+.gfill.only{background:linear-gradient(90deg,rgba(255,84,112,.35),var(--bad))}
+.gfill.exec{background:linear-gradient(90deg,rgba(51,214,159,.35),var(--ok))}
+.verdict{display:inline-flex;align-items:center;gap:10px;margin-top:8px;
+  font-family:var(--mono);font-size:13px;color:var(--tx-2);
+  border:1px solid var(--line);border-radius:999px;padding:8px 16px}
+.verdict b{color:var(--warn)}
+
+/* honest reading */
+.honest{background:linear-gradient(180deg,#0f1622,#0c111b);
+  border:1px solid var(--line);border-top:3px solid var(--warn);border-radius:18px;padding:34px}
+.honest h3{font-size:22px;font-weight:720;margin-bottom:6px}
+.honest .why{color:var(--tx-2);font-size:15px;max-width:80ch;margin-bottom:24px}
+.breakdown{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}
+.bd{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:18px}
+.bd .n{font-family:var(--mono);font-size:30px;font-weight:760}
+.bd .n.ok{color:var(--ok)} .bd .n.warn{color:var(--warn)} .bd .n.bad{color:var(--bad)}
+.bd .l{font-size:12.5px;color:var(--tx-2);margin-top:6px}
+.honest ul{margin:14px 0 0;padding-left:20px;color:var(--tx-2);font-size:14.5px}
+.honest li{margin-bottom:10px}
+.honest li b{color:var(--tx)}
+
+/* footer */
+.foot-sec{background:var(--ink-850)}
+.stack{display:flex;flex-wrap:wrap;gap:12px;margin:22px 0}
+.chip{font-family:var(--mono);font-size:12.5px;color:var(--tx-2);
+  border:1px solid var(--line);background:var(--panel-2);border-radius:9px;padding:9px 14px}
+.chip b{color:var(--tx)}
+.repro{color:var(--tx-3);font-size:13px;margin-top:18px;font-family:var(--mono);max-width:80ch;line-height:1.6}
+.src{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.src span{font-family:var(--mono);font-size:11.5px;color:var(--tx-3);
+  border:1px dashed var(--line);border-radius:6px;padding:4px 9px}
+
+/* triage mini */
+.triage-mini{margin-top:34px;background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:14px;padding:22px}
+.triage-mini .th{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+.triage-mini .th .k{font-family:var(--mono);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--accent)}
+.triage-mini .th .m{font-family:var(--mono);font-size:12.5px;color:var(--tx-3)}
+.histo{display:flex;align-items:flex-end;gap:5px;height:88px;margin-top:18px}
+.histo .col{flex:1;background:linear-gradient(180deg,var(--accent-2),rgba(52,211,238,.35));
+  border-radius:4px 4px 0 0;min-height:2px;position:relative}
+.histo-x{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10.5px;color:var(--tx-3);margin-top:8px}
+
+.foot-meta{color:var(--tx-3);font-size:12px;font-family:var(--mono);margin-top:26px}
+@media(max-width:820px){
+  .stat-row{grid-template-columns:1fr}
+  .dual,.drain,.breakdown{grid-template-columns:1fr}
+  .drain{gap:12px}.drain-arrow{transform:rotate(90deg)}
+  .bar-row{grid-template-columns:130px 1fr 60px}
+  .gbar{grid-template-columns:120px 1fr 56px}
+  .breakdown{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- ================= HERO ================= -->
+<header class="hero">
+  <div class="wrap">
+    <span class="badge"><span class="dot"></span> EXECUTION-GROUNDED TRIAGE &nbsp;/&nbsp; PROTOTYPE RESULTS</span>
+    <h1>Autonomous Smart Contract Auditor</h1>
+    <p class="lede">An execution-grounded smart-contract vulnerability triage pipeline that confirms bugs by running real exploits, not by trusting a static scanner or a model score.</p>
+    <div class="pipeline" id="pipeline"></div>
+  </div>
+</header>
+
+<!-- ================= MODULE A ================= -->
+<section id="moduleA">
+  <div class="wrap">
+    <p class="eyebrow">Module A &middot; Static Scan</p>
+    <h2>Slither over a labeled corpus</h2>
+    <p class="sub">The scanner is loud. Read the per-detector table, not the aggregate: the security-relevant detectors sit near zero false positives while style and version rules inflate the overall figure.</p>
+    <div class="stat-row" id="a-stats"></div>
+    <div style="height:40px"></div>
+    <h3 style="font-size:18px;margin-bottom:6px">False-positive rate by detector</h3>
+    <div class="legend">
+      <span><i style="background:var(--ok)"></i>low FP (security-relevant)</span>
+      <span><i style="background:var(--warn)"></i>mixed</span>
+      <span><i style="background:var(--bad)"></i>high FP (style / version noise)</span>
+      <span><i style="background:transparent;border:1px solid var(--accent)"></i><span class="tag sec" style="padding:1px 6px">SEC</span> reentrancy family &amp; friends</span>
+    </div>
+    <div id="a-chart"></div>
+    <p class="chart-caption" id="a-caption"></p>
+    <div style="height:36px"></div>
+    <h3 style="font-size:18px;margin-bottom:14px">Full per-detector table</h3>
+    <div class="tablewrap"><table id="a-table"></table></div>
+  </div>
+</section>
+
+<!-- ================= MODULE D ================= -->
+<section id="moduleD">
+  <div class="wrap">
+    <p class="eyebrow">Module D &middot; Exploit Agent</p>
+    <h2>The proof: a real drain</h2>
+    <p class="sub">A hand-written and agent-generated reentrancy exploit drained VulnerableVault under Foundry, asserting a real broken invariant. This is the confirmed anchor: execution, not a score, is the ground truth.</p>
+    <div id="d-drain"></div>
+    <div style="height:44px"></div>
+    <h3 style="font-size:18px;margin-bottom:14px">All labeled victims</h3>
+    <div class="tablewrap"><table id="d-table"></table></div>
+  </div>
+</section>
+
+<!-- ================= THE GAP ================= -->
+<section id="gap">
+  <div class="wrap">
+    <p class="eyebrow">Headline Result &middot; The Gap</p>
+    <h2>Model-only vs model-plus-execution</h2>
+    <p class="sub" id="gap-scope"></p>
+    <div class="gap-panel" id="gap-panel"></div>
+  </div>
+</section>
+
+<!-- ================= HONEST READING ================= -->
+<section id="honest">
+  <div class="wrap">
+    <div class="honest" id="honest-panel"></div>
+  </div>
+</section>
+
+<!-- ================= FOOTER ================= -->
+<section class="foot-sec" id="footer">
+  <div class="wrap">
+    <p class="eyebrow">Stack &amp; Reproducibility</p>
+    <h2 style="font-size:26px">How this was built</h2>
+    <div class="stack" id="stack"></div>
+    <p class="repro" id="repro"></p>
+    <div class="src" id="src"></div>
+    <p class="foot-meta" id="genmeta"></p>
+  </div>
+</section>
+
+<script id="dashboard-data" type="application/json">
+__DATA_JSON__
+</script>
+
+<script>
+"use strict";
+var DATA = JSON.parse(document.getElementById("dashboard-data").textContent);
+
+function el(tag, attrs, children){
+  var e=document.createElement(tag);
+  if(attrs) for(var k in attrs){
+    if(k==="class") e.className=attrs[k];
+    else if(k==="html") e.innerHTML=attrs[k];
+    else if(k==="text") e.textContent=attrs[k];
+    else e.setAttribute(k,attrs[k]);
+  }
+  if(children) children.forEach(function(c){ if(c) e.appendChild(c); });
+  return e;
+}
+function fmt(n){ return typeof n==="number" ? n.toLocaleString("en-US") : n; }
+function pct(v){ return (typeof v==="number") ? v.toFixed(1)+"%" : v; }
+
+// colour for an fp rate
+function fpColor(r){
+  if(r<=15) return "var(--ok)";
+  if(r<=60) return "var(--warn)";
+  return "var(--bad)";
+}
+var SEC_DETECTORS = {"reentrancy-eth":1,"reentrancy-unlimited-gas":1,"reentrancy-no-eth":1,
+  "arbitrary-send-eth":1,"arbitrary-send-erc20":1,"low-level-calls":1,"unchecked-transfer":1};
+
+/* ---------- pipeline ---------- */
+function renderPipeline(){
+  var stages=[
+    {k:"A",t:"Static Scan",d:"Slither over the corpus emits candidate findings."},
+    {k:"C1",t:"Triage Model",d:"A model score ranks each finding by likely exploitability."},
+    {k:"D",t:"Exploit Agent",d:"Generates an exploit, runs it under Foundry, checks the invariant."},
+    {k:"E",t:"Evaluation",d:"Compares model-only vs execution-grounded labels."}
+  ];
+  var arrow='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12h15M13 6l6 6-6 6"/></svg>';
+  var row=el("div",{class:"pipe-row"});
+  stages.forEach(function(s,i){
+    row.appendChild(el("div",{class:"stage"},[
+      el("div",{class:"k",text:"MODULE "+s.k}),
+      el("div",{class:"t",text:s.t}),
+      el("div",{class:"d",text:s.d})
+    ]));
+    if(i<stages.length-1) row.appendChild(el("div",{class:"arrow",html:arrow}));
+  });
+  var loop=el("div",{class:"loopwrap",html:
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>'+
+    '<span>Feedback loop: the agent’s pass / fail result re-labels findings that train the triage model.</span>'});
+  var host=document.getElementById("pipeline");
+  host.appendChild(row);
+  host.appendChild(loop);
+
+  // triage mini distribution
+  var t=DATA.triage;
+  var mini=el("div",{class:"triage-mini"});
+  mini.appendChild(el("div",{class:"th"},[
+    el("span",{class:"k",text:"Triage model (C1) score distribution · triage/scores.csv"}),
+    el("span",{class:"m",text:fmt(t.total)+" findings · mean "+t.mean+" · range "+t.min+"–"+t.max})
+  ]));
+  var mx=Math.max.apply(null,t.bins);
+  var histo=el("div",{class:"histo"});
+  t.bins.forEach(function(b){
+    var col=el("div",{class:"col"});
+    col.style.height=Math.max(2,(b/mx)*100)+"%";
+    col.title=b+" findings";
+    histo.appendChild(col);
+  });
+  mini.appendChild(histo);
+  mini.appendChild(el("div",{class:"histo-x"},[
+    el("span",{text:"0.0"}),el("span",{text:"score"}),el("span",{text:"1.0"})
+  ]));
+  host.appendChild(mini);
+}
+
+/* ---------- Module A ---------- */
+function renderModuleA(){
+  var A=DATA.moduleA, H=A.headline, C=A.corpus;
+  var stats=[
+    {label:"Total findings",val:fmt(H["total findings"]),cls:"acc",
+     foot:fmt(H["true positives"])+" TP · "+fmt(H["false positives"])+" FP"},
+    {label:"Contracts scanned",val:fmt(C["contracts scanned"]),cls:"",
+     foot:"of "+fmt(C["contracts in corpus"])+" in corpus · "+fmt(C["contracts skipped"])+" skipped"},
+    {label:"Overall false-positive rate",val:pct(H["overall false positive rate"]),cls:"warn2",
+     foot:"aggregate; a lower bound, see caption"}
+  ];
+  var host=document.getElementById("a-stats");
+  stats.forEach(function(s){
+    var big=el("div",{class:"big"+(s.cls==="acc"?" acc":"")});
+    big.textContent=s.val;
+    if(s.label.indexOf("false-positive")>=0) big.style.color="var(--warn)";
+    host.appendChild(el("div",{class:"card"},[
+      el("div",{class:"label",text:s.label}), big, el("div",{class:"foot",text:s.foot})
+    ]));
+  });
+
+  // chart: detectors with findings >= 5, sorted by findings desc
+  var chart=document.getElementById("a-chart");
+  var shown=A.detectors.filter(function(d){return d.findings>=5;})
+    .sort(function(a,b){return b.findings-a.findings;});
+  shown.forEach(function(d){
+    var isSec=!!SEC_DETECTORS[d.id];
+    var name=el("div",{class:"bar-name"});
+    if(isSec) name.appendChild(el("span",{class:"tag sec",text:"SEC"}));
+    name.appendChild(el("span",{text:d.id,title:d.id}));
+    var track=el("div",{class:"bar-track"});
+    var fill=el("div",{class:"bar-fill"});
+    fill.style.width=Math.max(1.5,d.fp_rate)+"%";
+    fill.style.background=fpColor(d.fp_rate);
+    track.appendChild(fill);
+    chart.appendChild(el("div",{class:"bar-row"},[
+      name, track,
+      el("div",{class:"bar-val",text:pct(d.fp_rate)})
+    ]));
+  });
+  var reo=A.detectors.filter(function(d){return d.id.indexOf("reentrancy")>=0||d.id==="arbitrary-send-eth"||d.id==="low-level-calls";});
+  document.getElementById("a-caption").textContent=
+    "Bars are false-positive rate per detector for detectors with 5 or more findings. The reentrancy family, arbitrary-send, and low-level-call rows sit at or near zero, while solc-version, timestamp, and style rules run to 100%. The aggregate "+pct(H["overall false positive rate"])+" is driven by whichever detector fires most often, on this corpus a style rule. Because SolidiFI injects densely, the measured rate is a lower bound against a sparser ground truth.";
+
+  // full table
+  var tbl=document.getElementById("a-table");
+  tbl.appendChild(el("thead",{},[el("tr",{},[
+    el("th",{text:"Detector"}),el("th",{class:"num",text:"Findings"}),
+    el("th",{class:"num",text:"TP"}),el("th",{class:"num",text:"FP"}),
+    el("th",{class:"num",text:"FP rate"})
+  ])]));
+  var tb=el("tbody");
+  A.detectors.forEach(function(d){
+    var nameCell=el("td",{});
+    if(SEC_DETECTORS[d.id]) nameCell.appendChild(el("span",{class:"tag sec",text:"SEC"}));
+    nameCell.appendChild(el("span",{class:"mono",text:" "+d.id}));
+    var rate=el("td",{class:"num",text:pct(d.fp_rate)});
+    rate.style.color=fpColor(d.fp_rate);
+    tb.appendChild(el("tr",{},[
+      nameCell, el("td",{class:"num",text:fmt(d.findings)}),
+      el("td",{class:"num",text:fmt(d.tp)}), el("td",{class:"num",text:fmt(d.fp)}), rate
+    ]));
+  });
+  tbl.appendChild(tb);
+}
+
+/* ---------- Module D ---------- */
+function renderModuleD(){
+  var D=DATA.moduleD, an=D.anchor;
+  var host=document.getElementById("d-drain");
+
+  var drain=el("div",{class:"drain"});
+  var before=el("div",{class:"vault"},[
+    el("div",{class:"who",text:"VulnerableVault · before"}),
+    el("div",{class:"amt",text:an.victim_before+" ETH"}),
+    (function(){var b=el("div",{class:"bar"});var i=el("i");i.style.width="100%";i.style.background="var(--tx-3)";b.appendChild(i);return b;})()
+  ]);
+  var after=el("div",{class:"vault"},[
+    el("div",{class:"who",text:"VulnerableVault · after"}),
+    (function(){var a=el("div",{class:"amt bad"});a.textContent=an.victim_after+" ETH";return a;})(),
+    (function(){var b=el("div",{class:"bar"});var i=el("i");i.style.width="2%";i.style.background="var(--bad)";b.appendChild(i);return b;})()
+  ]);
+  var arrow=el("div",{class:"drain-arrow"},[
+    el("div",{class:"lbl",text:"DRAIN"}),
+    el("div",{html:'<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 12h15M13 6l6 6-6 6"/></svg>'}),
+    el("div",{class:"lbl",text:"reentrancy"})
+  ]);
+  drain.appendChild(before); drain.appendChild(arrow); drain.appendChild(after);
+  host.appendChild(drain);
+
+  var dual=el("div",{class:"dual"});
+  dual.appendChild(el("div",{class:"vault"},[
+    el("div",{class:"who",text:"Attacker balance change"}),
+    (function(){var a=el("div",{class:"amt ok"});a.textContent="+"+an.attacker_delta+" ETH";return a;})(),
+    el("div",{class:"foot",style:"color:var(--tx-3);font-size:12.5px;margin-top:8px",
+      text:"took the entire honest pool · "+an.attempts+" attempt"})
+  ]));
+  dual.appendChild(el("div",{class:"invariant"},[
+    el("div",{class:"h",text:"Broken invariant asserted"}),
+    el("div",{text:an.invariant}),
+    el("div",{class:"mono",style:"margin-top:12px;color:var(--tx-3);font-size:11.5px",text:an.evidence})
+  ]));
+  host.appendChild(dual);
+
+  // victims table
+  var tbl=document.getElementById("d-table");
+  tbl.appendChild(el("thead",{},[el("tr",{},[
+    el("th",{text:"Contract"}),el("th",{text:"Class"}),el("th",{text:"Confirmed"}),
+    el("th",{class:"num",text:"Attempts"}),el("th",{text:"Result"}),el("th",{text:"Evidence"})
+  ])]));
+  var tb=el("tbody");
+  D.labels.forEach(function(l){
+    var pill=el("span",{class:"pill "+(l.confirmed?"pass":"fail")});
+    pill.textContent=l.confirmed?"PASS · drained":"FAIL";
+    var res=el("td",{});
+    var cat=el("span",{class:"tag",text:l.category_label});
+    if(l.category==="drained"){cat.style.color="var(--ok)";cat.style.borderColor="rgba(51,214,159,.5)";}
+    else if(l.category==="runtime_revert"){cat.style.color="var(--warn)";}
+    else if(l.category==="compile_failed"){cat.style.color="var(--bad)";}
+    else{cat.style.color="var(--tx-2)";}
+    res.appendChild(cat);
+    var tr=el("tr",{},[
+      el("td",{class:"mono",html:"<b>"+l.contract+"</b>"}),
+      el("td",{class:"mono",text:l.vuln_class}),
+      el("td",{},[pill]),
+      el("td",{class:"num",text:l.attempts}),
+      res,
+      el("td",{class:"evidence-cell",text:l.evidence})
+    ]);
+    if(l.confirmed) tr.style.background="rgba(51,214,159,.05)";
+    tb.appendChild(tr);
+  });
+  tbl.appendChild(tb);
+}
+
+/* ---------- The gap ---------- */
+function renderGap(){
+  var G=DATA.gap;
+  document.getElementById("gap-scope").textContent=G.scope;
+  var only=G.table["model-only"], exec=G.table["model-plus-execution"];
+  var host=document.getElementById("gap-panel");
+
+  var metrics=[
+    {key:"precision",name:"Precision",scale:1,unit:""},
+    {key:"recall",name:"Recall",scale:1,unit:""},
+    {key:"fp_rate",name:"False-positive rate",scale:1,unit:""}
+  ];
+  metrics.forEach(function(m){
+    var ov=only[m.key], ev=exec[m.key];
+    var delta=(ev-ov);
+    var block=el("div",{class:"metric-block"});
+    var deltaStr=(delta>=0?"+":"")+delta.toFixed(3);
+    var good = (m.key==="fp_rate") ? (delta<0) : (delta>0);
+    block.appendChild(el("div",{class:"mh"},[
+      el("span",{class:"name",text:m.name}),
+      (function(){var d=el("span",{class:"delta "+(good?"up":"down")});d.textContent="Δ "+deltaStr;d.style.color=good?"var(--ok)":"var(--bad)";return d;})()
+    ]));
+    // two bars
+    [["model-only",ov,"only"],["model-plus-execution",ev,"exec"]].forEach(function(pair){
+      var w=Math.max(2,pair[1]*100);
+      var track=el("div",{class:"gtrack"});
+      var fill=el("div",{class:"gfill "+pair[2]});
+      fill.style.width=w+"%";
+      track.appendChild(fill);
+      block.appendChild(el("div",{class:"gbar"},[
+        el("div",{class:"glbl",text:pair[0]==="model-only"?"model-only":"model+exec"}),
+        track,
+        el("div",{class:"gval",text:pair[1].toFixed(3)})
+      ]));
+    });
+    host.appendChild(block);
+  });
+
+  // confusion counts + verdict
+  var counts=el("div",{class:"grid",style:"grid-template-columns:1fr 1fr;gap:14px;margin-top:26px"});
+  [["model-only",only],["model-plus-execution",exec]].forEach(function(p){
+    counts.appendChild(el("div",{class:"card",style:"padding:16px 18px"},[
+      el("div",{class:"label",text:p[0]}),
+      el("div",{class:"mono",style:"margin-top:8px;color:var(--tx-2);font-size:13px",
+        text:"TP "+fmt(p[1].tp)+"  ·  FP "+fmt(p[1].fp)+"  ·  FN "+fmt(p[1].fn)+"  ·  TN "+fmt(p[1].tn)})
+    ]));
+  });
+  host.appendChild(counts);
+
+  var vb=el("div",{style:"margin-top:22px;display:flex;flex-wrap:wrap;gap:12px;align-items:center"});
+  var verdictWord=(G.verdict.split(".")[0]||"").trim();
+  vb.appendChild(el("div",{class:"verdict",html:"Verdict: <b>&nbsp;"+verdictWord+"&nbsp;</b>"}));
+  vb.appendChild(el("div",{style:"color:var(--tx-3);font-size:13px;font-family:var(--mono)",
+    text:G.counts.join("  ·  ")}));
+  host.appendChild(vb);
+}
+
+/* ---------- Honest reading ---------- */
+function renderHonest(){
+  var s=DATA.moduleD.summary, G=DATA.gap;
+  var host=document.getElementById("honest-panel");
+  host.appendChild(el("h3",{text:"How to read this gap"}));
+  host.appendChild(el("p",{class:"why",text:
+    "The gap is real and non-degenerate: execution grounding demotes findings the agent could not confirm, and the end-to-end mechanism (scan → generate exploit → run → label) works. But its magnitude is inflated, and here is exactly why."}));
+
+  var bd=el("div",{class:"breakdown"});
+  var cells=[
+    {n:s.drained,cls:"ok",l:"drained (confirmed): the VulnerableVault anchor"},
+    {n:s.runtime_revert,cls:"warn",l:"compiled and ran to a runtime revert"},
+    {n:s.compile_failed,cls:"bad",l:"failed to compile"},
+    {n:s.truncated,cls:"warn",l:"model output truncated (missing files)"}
+  ];
+  cells.forEach(function(c){
+    bd.appendChild(el("div",{class:"bd"},[
+      (function(){var n=el("div",{class:"n "+c.cls});n.textContent=c.n;return n;})(),
+      el("div",{class:"l",text:c.l})
+    ]));
+  });
+  host.appendChild(bd);
+
+  var ul=el("ul");
+  [
+    "<b>0 of the "+s.total_failed+" corpus victims were drained.</b> The harness scores every unconfirmed finding as a truth-negative. That includes the "+s.compile_failed+" that failed to compile and the "+s.truncated+" whose model output was truncated, where a local 7B model simply failed to produce a working exploit rather than execution proving the finding safe.",
+    "<b>The SolidiFI victims are largely undrainable in isolation.</b> Many are token contracts whose reentrancy sinks need external state or callers that do not exist in a standalone harness, so a failed drain is not evidence of safety.",
+    "<b>Real breakdown of the "+s.total_failed+" failures:</b> "+s.runtime_revert+" compiled and reverted at runtime, "+s.compile_failed+" failed to compile, and "+s.truncated+" were truncated model outputs. None of these outcomes proves the underlying finding is a false positive.",
+    "<b>The defensible claim.</b> On this reentrancy subset, execution grounding moves precision from "+G.table["model-only"].precision.toFixed(3)+" to "+G.table["model-plus-execution"].precision.toFixed(3)+" and false-positive rate from "+G.table["model-only"].fp_rate.toFixed(3)+" to "+G.table["model-plus-execution"].fp_rate.toFixed(3)+". The direction is correct and the plumbing is proven; the exact numbers would tighten with a stronger exploit model and drainable-in-isolation victims."
+  ].forEach(function(t){ ul.appendChild(el("li",{html:t})); });
+  host.appendChild(ul);
+
+  if(G.limitations && G.limitations.length){
+    host.appendChild(el("div",{style:"margin-top:22px;padding-top:18px;border-top:1px solid var(--line)"},[
+      el("div",{class:"mono",style:"font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--tx-3);margin-bottom:10px",text:"From eval/gap_report.md · limitations, verbatim"}),
+      (function(){var u=el("ul",{});u.style.marginTop="0";
+        G.limitations.forEach(function(t){u.appendChild(el("li",{text:t}));});return u;})()
+    ]));
+  }
+}
+
+/* ---------- footer ---------- */
+function renderFooter(){
+  var stack=[
+    ["Slither","static analysis · Module A"],
+    ["Foundry","exploit execution · forge"],
+    ["Triage model","XGBoost-style baseline · C1 scores"],
+    ["Ollama qwen2.5-coder","local 7B exploit generation"],
+    ["SolidiFI corpus","labeled injected vulnerabilities"]
+  ];
+  var host=document.getElementById("stack");
+  stack.forEach(function(s){
+    host.appendChild(el("div",{class:"chip",html:"<b>"+s[0]+"</b> &nbsp;"+s[1]}));
+  });
+  document.getElementById("repro").textContent=
+    "All results are reproducible from the committed output files. This dashboard is a read-only presentation layer: dashboard/build.py reads the five files below and regenerates dashboard/index.html with the data embedded. No number here is entered by hand.";
+  var src=document.getElementById("src");
+  DATA.meta.sources.forEach(function(p){ src.appendChild(el("span",{text:p})); });
+  document.getElementById("genmeta").textContent="Generated "+DATA.meta.generated+" from committed outputs · dashboard/build.py";
+}
+
+renderPipeline();
+renderModuleA();
+renderModuleD();
+renderGap();
+renderHonest();
+renderFooter();
+</script>
+</body>
+</html>
+'''
+
+
+if __name__ == "__main__":
+    data = build_data()
+    out = render(data)
+    # tiny console summary for the build log
+    A = data["moduleA"]
+    print("Wrote", out)
+    print("  findings:", A["headline"].get("total findings"),
+          "| overall FP:", A["headline"].get("overall false positive rate"),
+          "| contracts:", A["corpus"].get("contracts scanned"))
+    print("  detectors parsed:", len(A["detectors"]))
+    print("  labels:", data["moduleD"]["summary"])
+    print("  gap model-only:", data["gap"]["table"].get("model-only"))
+    print("  gap exec:", data["gap"]["table"].get("model-plus-execution"))
+    print("  triage scores:", data["triage"]["total"], "mean", data["triage"]["mean"])
