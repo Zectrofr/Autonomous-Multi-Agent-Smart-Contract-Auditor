@@ -1,0 +1,12 @@
+# Module A (static scan) runtime dependencies. Python 3.11.
+slither-analyzer==0.11.6
+solc-select==1.2.0
+
+# Mythril is intentionally NOT pinned here. It is optional and off by default
+# because a full symbolic execution pass is far too slow for this corpus run.
+# To enable it later: pip install mythril  and pass --with-mythril to the scan.
+
+# Module C1 (baseline triage) and Module F (evaluation harness) dependencies.
+# A small logistic regression over static finding metadata; numpy/scipy come in
+# as scikit-learn's own dependencies.
+scikit-learn==1.9.0

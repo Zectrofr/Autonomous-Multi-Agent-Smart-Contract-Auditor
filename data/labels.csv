@@ -1,0 +1,2 @@
+contract,vuln_class,confirmed,attempts,invariant_asserted,evidence
+VulnerableVault,reentrancy,true,1,"the victim's ether balance is drained to at or near zero, and the attacker ends up with materially more ether than it deposited (at least the honest pool it stole)","(self-test reference) vault 30e18 -> 0, attacker +30e18"

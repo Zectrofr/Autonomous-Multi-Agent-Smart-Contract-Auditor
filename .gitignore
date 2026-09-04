@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# solc binaries fetched by solc-select
+.solc-select/
+solc-select/
+crytic-export/
+
+# Raw analyzer output kept out of version control
+data/raw/
+
+# Editors and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
