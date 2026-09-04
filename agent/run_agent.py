@@ -33,7 +33,7 @@ from typing import Dict, Optional, Tuple
 
 from agent import prompts
 from agent.labels import Label, append_label
-from agent.sandbox import Sandbox, SandboxResult
+from agent.sandbox import Sandbox, SandboxResult, select_victim_solc
 
 # Default Anthropic model. Chosen by checking the current model list rather than
 # from memory (see agent/README.md): claude-opus-5 is the current default Claude
@@ -47,6 +47,29 @@ DEFAULT_RETRIES = 3
 # env var. The host is overridable with OLLAMA_HOST.
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+# Per call timeout for the local model. Generous enough for a 7B to write two
+# Solidity files, but capped so one stuck generation fails that attempt instead
+# of hanging the whole run. Overridable with OLLAMA_TIMEOUT (seconds).
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600") or "600")
+
+# Hard cap on generated tokens per call. Enough for two Solidity files with room
+# to spare, and it keeps the small local model from generating until it fills
+# the context window. Overridable with OLLAMA_NUM_PREDICT.
+OLLAMA_NUM_PREDICT = int(os.environ.get("OLLAMA_NUM_PREDICT", "4096") or "4096")
+
+# Context window for the local model. Large enough for the victim source plus the
+# prompt scaffolding; on a CPU backend a smaller window decodes faster, so this
+# is overridable with OLLAMA_NUM_CTX to fit the machine and the victim size.
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384") or "16384")
+
+# How long Ollama keeps the model resident between calls. The retry loop and a
+# batch make several calls seconds to minutes apart; without this the model
+# unloads after Ollama's short default and every call pays a cold reload (tens of
+# seconds), which dominates the run and can trip the per call timeout. Keeping it
+# warm makes each subsequent call just the (fast) decode. Overridable with
+# OLLAMA_KEEP_ALIVE (any duration Ollama accepts, e.g. "30m").
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "").strip() or "30m"
 
 # Backend selection. The CLI --backend flag wins; then the AGENT_BACKEND env var;
 # then this default. ollama is the default so the agent runs with no paid API.
@@ -86,28 +109,34 @@ def resolve_forge() -> str:
 # Victim inspection
 # ---------------------------------------------------------------------------
 
-def inspect_victim(victim_path: Path) -> Tuple[str, str, str]:
-    """Return (source_text, primary_contract_name, pragma) for the victim.
+def inspect_victim(victim_path: Path) -> Tuple[str, str, str, str, bool]:
+    """Return (source_text, primary_contract_name, exploit_pragma, victim_solc,
+    cross_version) for the victim.
 
     The primary contract name is the last top level `contract X` declaration,
-    which for these single-purpose victims is the one under test. The pragma is
-    normalized to a fixed 0.8.x so the generated files pin cleanly; anything not
-    already a fixed 0.8 version falls back to the project's 0.8.28 pin.
+    which for these single-purpose victims is the one under test.
+
+    victim_solc is the concrete compiler the victim will be compiled at, chosen
+    from its pragma by the same Module A logic the sandbox uses (older, open
+    ended pragmas are capped so a 0.5.x contract is not handed a 0.8.x compiler).
+
+    cross_version is True when the victim is not a 0.8.x contract. In that case
+    the generated attacker and test are written in 0.8.x (exploit_pragma 0.8.28)
+    and reach the victim through vm.deployCode instead of importing it, because a
+    0.8.x file cannot import a lower version source and forge-std needs >=0.8.13.
+    When the victim is already 0.8.x, the generated files share its exact version
+    and import it directly (the original step one flow).
     """
     source = victim_path.read_text(encoding="utf-8", errors="replace")
 
     names = re.findall(r"^\s*contract\s+(\w+)", source, re.MULTILINE)
     contract_name = names[-1] if names else victim_path.stem
 
-    pragma = "0.8.28"
-    match = re.search(r"pragma\s+solidity\s+([^;]+);", source)
-    if match:
-        raw = match.group(1).strip()
-        exact = re.fullmatch(r"0\.8\.\d+", raw)
-        if exact:
-            pragma = raw
+    victim_solc, _reason = select_victim_solc(source)
+    cross_version = not victim_solc.startswith("0.8.")
+    exploit_pragma = "0.8.28" if cross_version else victim_solc
 
-    return source, contract_name, pragma
+    return source, contract_name, exploit_pragma, victim_solc, cross_version
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +254,20 @@ def call_llm_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
         ],
         # Non streaming so the whole answer arrives as one JSON object.
         "stream": False,
+        # Keep the model resident between calls so the retry loop and batch do not
+        # pay a cold reload every time.
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             # Low temperature for more deterministic code output.
             "temperature": 0.2,
             # Raise the context window well above Ollama's small default so the
             # full victim source and prompt scaffolding are not silently cut.
-            "num_ctx": 16384,
+            "num_ctx": OLLAMA_NUM_CTX,
+            # Cap the number of generated tokens. Two Solidity files fit well
+            # under this; the cap stops the small local model from running away
+            # (repeating until it fills the context window), which otherwise
+            # stalls a generation until the request times out.
+            "num_predict": OLLAMA_NUM_PREDICT,
         },
     }
     data = json.dumps(payload).encode("utf-8")
@@ -238,8 +275,15 @@ def call_llm_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
-        with urllib.request.urlopen(request, timeout=900) as response:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
             body = response.read().decode("utf-8", errors="replace")
+    except TimeoutError:
+        # A single slow or stuck local generation must not kill the whole run.
+        # Treat it as an empty (failed) candidate so the loop records a failed
+        # attempt and moves on, rather than crashing and leaving no label.
+        print(f"  ollama call timed out after {OLLAMA_TIMEOUT}s; treating as a "
+              "failed attempt")
+        return ""
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         raise SystemExit(
@@ -417,12 +461,18 @@ def run_victim(
       - stop on the first pass or when attempts run out
       - write one execution grounded label row
     """
-    source, contract_name, pragma = inspect_victim(victim_path)
+    source, contract_name, pragma, victim_solc, cross_version = inspect_victim(victim_path)
     profile = prompts.VULN_PROFILES.get(vuln_class, prompts.VULN_PROFILES["reentrancy"])
     invariant = profile["invariant"]
 
     sandbox = Sandbox(exploits_dir, forge_bin=resolve_forge())
     victim_basename = sandbox.prepare_victim(victim_path)
+    deploy_code_target = f"{victim_basename}:{contract_name}"
+    if cross_version:
+        print(f"  victim solc {victim_solc}: cross-version mode "
+              f"(deployCode {deploy_code_target}, exploit in {pragma})")
+    else:
+        print(f"  victim solc {victim_solc}: import mode (exploit in {pragma})")
 
     feedback: Optional[str] = None
     attempts = 0
@@ -445,6 +495,9 @@ def run_victim(
                 vuln_class=vuln_class,
                 pragma=pragma,
                 feedback=feedback,
+                cross_version=cross_version,
+                victim_solc=victim_solc,
+                deploy_code_target=deploy_code_target,
             )
             print(f"  asking {model} via {backend} for an exploit"
                   + (" (with feedback from the last failure)" if feedback else ""))
@@ -473,6 +526,17 @@ def run_victim(
         print("  running forge test on the generated exploit...")
         result = sandbox.run_generated_test()
 
+        # Hard stop: if forge/svm cannot obtain the victim's solc at all, this is
+        # an environment failure, not a failed drain. Report it precisely and do
+        # NOT write a misleading label.
+        if result.solc_unavailable:
+            sandbox.cleanup()
+            raise SystemExit(
+                f"ERROR: forge/svm could not obtain solc {victim_solc} for "
+                f"{contract_name}; this is a hard stop, not a failed drain.\n"
+                f"forge reported:\n{result.error_text}"
+            )
+
         # 5: branch on the real execution result.
         if result.passed:
             print(f"  PASS: {result.evidence}")
@@ -482,6 +546,8 @@ def run_victim(
             # Mark provenance so a reader of labels.csv can tell an offline
             # self-test row (built in reference candidate) from a live LLM row.
             evidence = result.evidence
+            if cross_version:
+                evidence = f"(solc {victim_solc}) {evidence}"
             if self_test:
                 evidence = f"(self-test reference) {evidence}"
             label = Label(
@@ -502,13 +568,16 @@ def run_victim(
     # Retries exhausted without a pass. Remove the generated files so the project
     # still builds, then write a not-confirmed label with the final error.
     sandbox.cleanup()
+    fail_evidence = _short(last_error, 200)
+    if cross_version:
+        fail_evidence = f"(solc {victim_solc}) {fail_evidence}"
     label = Label(
         contract=contract_name,
         vuln_class=vuln_class,
         confirmed=False,
         attempts=attempts,
         invariant_asserted=invariant,
-        evidence=_short(last_error, 200),
+        evidence=fail_evidence,
     )
     append_label(label, labels_path)
     return label

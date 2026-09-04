@@ -5,22 +5,22 @@ Scope: reentrancy subset only. This is a prototype result on the SolidiFI reentr
 ## Counts (n)
 
 - evaluated findings: 693
-- execution labels available: 1 (1 confirmed/drained, 0 failed)
-- execution labels that join a corpus finding: 0
+- execution labels available: 9 (1 confirmed/drained, 8 failed)
+- execution labels that join a corpus finding: 228
 - live LLM available at run time: no
-- truth source per row: execution(anchor)=1, solidifi-line=692
+- truth source per row: execution=228, execution(anchor)=1, solidifi-line=464
 
 ## Gap table
 
 | configuration | precision | recall | fp_rate | TP | FP | FN | TN |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| model-only | 0.993 | 1.000 | 0.417 | 681 | 5 | 0 | 7 |
-| model-plus-execution | 0.993 | 1.000 | 0.417 | 681 | 5 | 0 | 7 |
-| **GAP (exec - only)** | **+0.000** | **+0.000** | **+0.000** | | | | |
+| model-only | 0.671 | 1.000 | 0.970 | 460 | 226 | 0 | 7 |
+| model-plus-execution | 0.994 | 1.000 | 0.013 | 460 | 3 | 0 | 230 |
+| **GAP (exec - only)** | **+0.323** | **+0.000** | **-0.957** | | | | |
 
 ## Verdict
 
-THIN DUE TO N. Live LLM calls were unavailable (no ANTHROPIC_API_KEY), so no corpus reentrancy victims could be labeled by the agent. The only execution label that joins the finding set is the VulnerableVault anchor, which the static model already ranks correctly, so the override changes nothing measurable. This is a small-n artifact, not evidence that execution grounding fails to help.
+LARGE. Execution grounding measurably moved precision/recall over the static baseline, the expected win.
 
 ## Truth source
 

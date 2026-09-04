@@ -114,6 +114,156 @@ def _evidence_block() -> str:
     )
 
 
+def _import_mode_instructions(
+    victim_contract_name: str, victim_basename: str, pragma: str
+) -> str:
+    """FILE 1 / FILE 2 instructions when the victim shares the generated files'
+    solc version and can be imported directly. This is the original step one
+    flow, unchanged."""
+    attacker_imports = f'import {{{victim_contract_name}}} from "./{victim_basename}";'
+    test_imports = (
+        'import {Test, console2} from "forge-std/Test.sol";\n'
+        f'import {{{victim_contract_name}}} from '
+        f'"../../src/generated/{victim_basename}";\n'
+        'import {Attacker} from "../../src/generated/Attacker.sol";'
+    )
+    return (
+        "Write two files.\n"
+        "\n"
+        f"FILE 1 at {ATTACKER_PATH}: an Attacker contract that exploits the bug "
+        "end to end (deposit a small stake, trigger the vulnerable path, and "
+        "drive the exploit until the victim is drained), plus a way for its "
+        "owner to collect the stolen ether. Use this pragma and import exactly:\n"
+        f"    pragma solidity {pragma};\n"
+        f"    {attacker_imports}\n"
+        "\n"
+        f"FILE 2 at {TEST_PATH}: a Foundry test that funds the victim with a "
+        "realistic honest pool (several ether from a few honest depositors), "
+        "snapshots balances, runs the attacker, and asserts the broken "
+        "invariant above using forge-std assertions (assertApproxEqAbs for the "
+        "drained balance, assertGt / assertGe for the attacker profit). Use this "
+        "pragma and these imports exactly:\n"
+        f"    pragma solidity {pragma};\n"
+        f"    {test_imports}\n"
+        "\n"
+        f"{_evidence_block()}\n"
+    )
+
+
+def _cross_version_instructions(
+    victim_contract_name: str,
+    victim_basename: str,
+    pragma: str,
+    victim_solc: str,
+    deploy_code_target: str,
+) -> str:
+    """FILE 1 / FILE 2 instructions when the victim is an older solc contract.
+
+    The victim compiles separately at its own solc; the generated files are
+    0.8.x and must not import the victim (a cross version import does not
+    compile). They reach the victim through vm.deployCode and an interface. This
+    is the Foundry native pattern for testing a contract of a different compiler
+    version, and it keeps forge-std (which needs >=0.8.13) usable in the test.
+    """
+    test_imports = (
+        'import {Test, console2} from "forge-std/Test.sol";\n'
+        'import {Attacker} from "../../src/generated/Attacker.sol";'
+    )
+    return (
+        "IMPORTANT COMPILER NOTE. The victim is written for solc "
+        f"{victim_solc}, an older compiler than the 0.8.x you must write the "
+        "exploit in. You CANNOT import the victim source: forge-std needs solc "
+        ">=0.8.13, so the test must be 0.8.x, and a 0.8.x file cannot import a "
+        f"{victim_solc} file. Instead, reach the victim at runtime through "
+        "vm.deployCode and a Solidity interface you declare yourself. Do not "
+        "reproduce or paste the victim's code into your files. Write ordinary "
+        "modern 0.8.x Solidity (constructor() keyword, receive() external "
+        "payable for the reentry hook, address(x).call{value: v}(\"\") for the "
+        "low level call, explicit payable(addr) casts). Solidity 0.8 has checked "
+        "arithmetic, which is fine here.\n"
+        "\n"
+        "Write two files.\n"
+        "\n"
+        f"FILE 1 at {ATTACKER_PATH}: use exactly:\n"
+        f"    pragma solidity {pragma};\n"
+        "Declare a minimal interface for only the victim functions you call, for "
+        "example:\n"
+        "    interface IVictim { function someWithdraw() external; function someDeposit() external payable; }\n"
+        "The Attacker takes the victim address in its constructor and casts it to "
+        "your interface (IVictim(victimAddr)). It exploits the bug end to end "
+        "(stake if the vulnerable path needs a recorded balance, trigger the "
+        "vulnerable call, and for reentrancy re-enter from receive()/fallback() "
+        "until the victim is drained), and lets its owner collect the stolen "
+        "ether. It must NOT import the victim.\n"
+        "\n"
+        f"FILE 2 at {TEST_PATH}: use exactly:\n"
+        f"    pragma solidity {pragma};\n"
+        f"    {test_imports}\n"
+        "Deploy the victim from its separately compiled artifact with:\n"
+        f'    address victimAddr = deployCode("{deploy_code_target}");\n'
+        "then declare/reuse an interface to interact with it. Fund a realistic "
+        "honest pool through the victim's own deposit path if it has one (several "
+        "ether from a few honest depositors via vm.deal + vm.prank), or with "
+        "vm.deal(victimAddr, ...) if the vulnerable payout does not depend on a "
+        "recorded balance. Snapshot balances, run the attacker, and assert the "
+        "broken invariant above using forge-std assertions (assertApproxEqAbs "
+        "for the drained balance, assertGt / assertGe for the attacker profit). "
+        "If the victim's primary contract constructor needs arguments, pass them "
+        'as deployCode("' + deploy_code_target + '", abi.encode(...)).\n'
+        "\n"
+        "Follow this exact skeleton, filling in the interface functions and the "
+        "attack logic. Keep every structural line as shown:\n"
+        "\n"
+        f"// {ATTACKER_PATH}\n"
+        "// SPDX-License-Identifier: MIT\n"
+        f"pragma solidity {pragma};\n"
+        "interface IVictim {\n"
+        "    // declare ONLY the victim functions you call; mark a function payable\n"
+        "    // if you send ether to it, e.g. function deposit() external payable;\n"
+        "}\n"
+        "contract Attacker {\n"
+        "    IVictim public victim;\n"
+        "    address public owner;\n"
+        "    constructor(address victimAddr) { victim = IVictim(victimAddr); owner = msg.sender; }\n"
+        "    function attack() external payable { /* stake if needed, then trigger the vulnerable call */ }\n"
+        "    receive() external payable { /* re-enter victim.<withdraw>() while it can still pay */ }\n"
+        "    function sweep() external { payable(owner).transfer(address(this).balance); }\n"
+        "}\n"
+        "\n"
+        f"// {TEST_PATH}\n"
+        "// SPDX-License-Identifier: MIT\n"
+        f"pragma solidity {pragma};\n"
+        f"{test_imports}\n"
+        "interface IVictim {\n"
+        "    // declare it AGAIN here with the same functions; interfaces do not\n"
+        "    // cross files, so referencing IVictim without this line fails to compile\n"
+        "}\n"
+        "contract Exploit is Test {\n"
+        "    function test_exploit_drains_victim() public {\n"
+        f'        address victimAddr = deployCode("{deploy_code_target}");\n'
+        "        // fund an honest pool via the victim's deposit path if it has one,\n"
+        "        // otherwise vm.deal(victimAddr, 10 ether);\n"
+        "        Attacker attacker = new Attacker(victimAddr);   // keep the instance, not an address\n"
+        "        uint256 vaultBefore = victimAddr.balance;\n"
+        "        attacker.attack{value: 1 ether}();              // call methods on the instance\n"
+        "        // sweep, snapshot vaultAfter and attacker profit\n"
+        "        // console2.log the three evidence lines, then assert the invariant\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "Hard compile rules from the skeleton: deployCode returns an address (store "
+        "it in an address); declare the interface in BOTH files; deploy the attacker "
+        "with `new Attacker(victimAddr)` and call methods on that instance, never on "
+        "a plain address; mark any interface function you send value to as payable. "
+        "Read a contract's ether balance as `address(attacker).balance` and "
+        "`victimAddr.balance`, never `attacker.balance`. Only send `{value: ...}` to "
+        "deposit-style or stake functions that are payable; a withdraw function "
+        "takes no value, so never write `withdraw{value: ...}()`.\n"
+        "\n"
+        f"{_evidence_block()}\n"
+    )
+
+
 def build_user_prompt(
     victim_contract_name: str,
     victim_basename: str,
@@ -121,26 +271,32 @@ def build_user_prompt(
     vuln_class: str,
     pragma: str,
     feedback: Optional[str] = None,
+    cross_version: bool = False,
+    victim_solc: Optional[str] = None,
+    deploy_code_target: Optional[str] = None,
 ) -> str:
     """Assemble the per attempt user prompt.
 
     feedback is the captured error from the previous attempt. When present it is
     placed up front so the model treats fixing it as the priority. That is what
     makes this a real retry loop and not a blind re-ask.
+
+    Two generation modes:
+
+      import mode (cross_version False): the victim compiles at the same solc as
+        the generated files (both 0.8.x), so the attacker and test import the
+        victim source directly. This is the original step one flow, unchanged.
+
+      cross version mode (cross_version True): the victim is an older contract
+        (for example solc 0.5.x) that cannot be imported into a 0.8.x file, and
+        forge-std itself requires >=0.8.13 so the test must be 0.8.x. The victim
+        is therefore compiled separately at victim_solc and reached at runtime
+        through vm.deployCode plus an interface; the generated files never import
+        the victim source. `pragma` here is the 0.8.x pragma for the generated
+        files, and deploy_code_target is the "<file>:<Contract>" the test passes
+        to vm.deployCode.
     """
     profile = VULN_PROFILES.get(vuln_class, VULN_PROFILES["reentrancy"])
-
-    # Exact import lines. The sandbox copies the victim into src/generated/, so
-    # the attacker sits beside it and the test reaches both from test/generated/.
-    attacker_imports = (
-        f'import {{{victim_contract_name}}} from "./{victim_basename}";'
-    )
-    test_imports = (
-        'import {Test, console2} from "forge-std/Test.sol";\n'
-        f'import {{{victim_contract_name}}} from '
-        f'"../../src/generated/{victim_basename}";\n'
-        'import {Attacker} from "../../src/generated/Attacker.sol";'
-    )
 
     parts = []
 
@@ -171,27 +327,20 @@ def build_user_prompt(
         "```\n"
     )
 
-    parts.append(
-        "Write two files.\n"
-        "\n"
-        f"FILE 1 at {ATTACKER_PATH}: an Attacker contract that exploits the bug "
-        "end to end (deposit a small stake, trigger the vulnerable path, and "
-        "drive the exploit until the victim is drained), plus a way for its "
-        "owner to collect the stolen ether. Use this pragma and import exactly:\n"
-        f"    pragma solidity {pragma};\n"
-        f"    {attacker_imports}\n"
-        "\n"
-        f"FILE 2 at {TEST_PATH}: a Foundry test that funds the victim with a "
-        "realistic honest pool (several ether from a few honest depositors), "
-        "snapshots balances, runs the attacker, and asserts the broken "
-        "invariant above using forge-std assertions (assertApproxEqAbs for the "
-        "drained balance, assertGt / assertGe for the attacker profit). Use this "
-        "pragma and these imports exactly:\n"
-        f"    pragma solidity {pragma};\n"
-        f"    {test_imports}\n"
-        "\n"
-        f"{_evidence_block()}\n"
-    )
+    if cross_version:
+        parts.append(_cross_version_instructions(
+            victim_contract_name=victim_contract_name,
+            victim_basename=victim_basename,
+            pragma=pragma,
+            victim_solc=victim_solc or "an older solc",
+            deploy_code_target=deploy_code_target or f"{victim_basename}:{victim_contract_name}",
+        ))
+    else:
+        parts.append(_import_mode_instructions(
+            victim_contract_name=victim_contract_name,
+            victim_basename=victim_basename,
+            pragma=pragma,
+        ))
 
     parts.append(
         "Output format, followed exactly, nothing else:\n"
